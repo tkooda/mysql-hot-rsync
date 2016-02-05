@@ -1,6 +1,0 @@
-- allow debug/pretend mode
-- get mysql user/pass from env(/argv?)
-  - ~/.mysql-hot-rsync.conf file? (ENV to pick alt?)
-- allow mkdir() of initial missing dir
-- copy uid/gid perms on db dirs?
-- pre python-2.4 system() compatability?
