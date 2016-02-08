@@ -17,8 +17,8 @@
 ##  - uses rsync to save a SAFE (non-corrupted) backup of LIVE mysql databases and/or tables
 
 ## NOTES:
-##  - if no db is specified, it will save all databases
-##  - if no tables are specified, it will save all tables
+##  - if no database is specified, it will save all databases
+##  - if no tables are specified, it will save all tables in those databases
 
 
 import os
@@ -52,9 +52,10 @@ def mysql_connect( username, password ):
 def mysql_query( cursor, query ):
     try:
         cursor.execute( query )
+        return True # no error
     except:
-        print >>sys.stderr, "ERROR: mysql query: '%s'" % query
-        sys.exit( 1 )
+        print >>sys.stderr, "ERROR: mysql query failed: '%s'" % query
+        return False # error.  -to be able to keep trying to sync other DBs
 
 
 def get_mysql_data_dir( con ):
@@ -65,18 +66,36 @@ def get_mysql_data_dir( con ):
     return datadir
 
 
+def get_databases( con, db_regex ): # allow '%' wildcards in database names
+    if '%' not in db_regex:
+        return { db_regex: [] }
+    
+    cursor = con.cursor()
+    mysql_query( cursor, "SHOW DATABASES LIKE '%s'" % db_regex )
+    dbs = {} # build dict of dbs (each being an empty array of tables), for easier assigning later
+    for db in cursor.fetchall():
+        dbs[ db[0] ] = []
+    cursor.close()
+    return dbs
+
+
 def get_dbs_and_tables( con, db, tables ):
     d = {}
     
-    # user already specified db and tables..
+    # user already specified a single (non-regex) db and tables..
     if tables:
-        return { db: tables }
+        if '%' not in db:
+            return { db: tables }
+        else:
+            d = get_databases( con, db )
+            for db_item in d:
+                d[ db_item ] = tables # odd usage: specify static tables for regex of dbs
     
     cursor = con.cursor()
     
     if db:
         # user specified (one) db but no tables..
-        d = { db: [] }
+        d = get_databases( con, db )
     else:
         # no dbs yet, find+store all dbs..
         mysql_query( cursor, "SHOW DATABASES" )
@@ -100,8 +119,11 @@ def get_dbs_and_tables( con, db, tables ):
 def lock_table( cursor, db, table ):
     subprocess.call( "sync" ) # force OS to flush any buffered changes to filesystem (so next `sync` call is faster when the lock is actually held)
     mysql_query( cursor, "USE `%s`" % db )
-    mysql_query( cursor, "FLUSH TABLE `%s` WITH READ LOCK" % table ) # flush+lock one table (allows reading, prevents writing)
+    if not mysql_query( cursor, "FLUSH TABLE `%s` WITH READ LOCK" % table ): # flush+lock one table (allows reading, prevents writing)
+        debug( 1, "lock_table() mysql_query() flush table failed", table )
+        return False
     subprocess.call( "sync" ) # force OS to flush any buffered changes to filesystem
+    return True
 
 
 def backup_table( path_dest_dir, data_dir, con, db, table ):
@@ -123,7 +145,9 @@ def backup_table( path_dest_dir, data_dir, con, db, table ):
             print >>sys.stderr, "WARNING: rsync failed for warming up backup copy of: %s.%s" % ( db, table )
     
     cursor = con.cursor() # for lock
-    lock_table( cursor, db, table )
+    if not lock_table( cursor, db, table ):
+        debug( 1, "backup_table() lock_table() failed:", db, table )
+        return 1 # error locking table, bail out now: don't sync possibly inconsistant file on fs
     
     for path_file in path_files:
         debug( 7, "path_file:", path_file )
@@ -135,7 +159,8 @@ def backup_table( path_dest_dir, data_dir, con, db, table ):
         if backup_table_file( path_dest_dir, data_dir, db, path_file ): # do final rsync on each table file
             errors += 1
     
-    mysql_query( cursor, "UNLOCK TABLES" ) # unlock all tables held by this session
+    if not mysql_query( cursor, "UNLOCK TABLES" ): # unlock all tables held by this session
+        errors += 1
     cursor.close() # for lock
     
     return errors
@@ -230,11 +255,14 @@ for db, tables in get_dbs_and_tables( con, arg_db, arg_tables ).iteritems():
     
     for table in tables:
         if not backup_table( path_dest_dir, data_dir, con, db, table ):
-            print >>sys.stderr, "syncd: %s.%s" % ( db, table )
+            print "syncd: %s.%s" % ( db, table )
         else:
             print >>sys.stderr, "FAILED: %s.%s" % ( db, table )
             errors += 1
 
-debug( 4, "exit errors:", errors )
+if errors:
+    print >>sys.stderr, "ERRORS:", errors
+
+debug( 8, "exit errors:", errors )
 sys.exit( errors )
 
